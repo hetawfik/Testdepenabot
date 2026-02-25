@@ -1,18 +1,7 @@
 {
-  "name": "my-cool-app",
+  "name": "vulnerable-test-app",
   "version": "1.0.0",
-  "description": "This is my cool app",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "author": "Me",
-  "license": "MIT",
   "dependencies": {
-    "express": "^1.13.3"
-  },
-  "devDependencies": {
-    "jest": "^29.7.0"
+    "lodash": "4.17.15"
   }
 }
