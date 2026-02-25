@@ -1,0 +1,13 @@
+{
+  "name": "manual-vulnerability-trigger",
+  "version": "1.0.0",
+  "lockfileVersion": 2,
+  "requires": true,
+  "dependencies": {
+    "lodash": {
+      "version": "4.17.15",
+      "resolved": "https://registry.npmjs.org",
+      "integrity": "sha512-8xOcRHvCjnocdS5cpwXQXVzkeX5wpvSbVm6KPr8696YRSYnKXXchpiyIW7x9vMNSzhBnSYLNoP5fOW9dnVaTMA=="
+    }
+  }
+}
