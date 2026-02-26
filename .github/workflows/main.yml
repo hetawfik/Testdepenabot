@@ -1,0 +1,117 @@
+name: Auto-fix Dependabot alerts (Multi-ecosystem)
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:  # Enables manual trigger
+    inputs:
+      severity:
+        description: 'Severity filter'
+        required: false
+        default: 'high,critical'
+        type: choice
+        options:
+          - 'low,medium,high,critical'
+          - 'medium,high,critical'
+          - 'high,critical'
+          - 'critical'
+      ecosystem:
+        description: 'Ecosystem (leave empty for auto-detect)'
+        required: false
+        type: choice
+        options:
+          - ''
+          - 'npm'
+          - 'maven'
+          - 'python'
+      auto_merge:
+        description: 'Auto-merge if tests pass'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: write
+  security-events: read
+
+jobs:
+  fix-vulnerabilities:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Detect project type
+        id: detect
+        run: |
+          ECOSYSTEM="${{ inputs.ecosystem }}"
+          
+          if [ -z "$ECOSYSTEM" ]; then
+            if [ -f "package.json" ]; then
+              ECOSYSTEM="npm"
+            elif [ -f "pom.xml" ]; then
+              ECOSYSTEM="maven"
+            elif [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then
+              ECOSYSTEM="python"
+            fi
+          fi
+          
+          echo "type=$ECOSYSTEM" >> $GITHUB_OUTPUT
+          
+      - name: Get Dependabot alerts
+        id: alerts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const severity = '${{ inputs.severity || 'high,critical' }}';
+            
+            const alerts = await github.rest.dependabot.listAlertsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              severity: severity
+            });
+            
+            const ecosystem = '${{ steps.detect.outputs.type }}';
+            const ecosystemMap = {
+              'npm': 'npm',
+              'maven': 'maven',
+              'python': 'pip'
+            };
+            
+            const vulnerabilities = alerts.data
+              .filter(alert => alert.security_advisory.package.ecosystem === ecosystemMap[ecosystem])
+              .map(alert => ({
+                package: alert.security_advisory.package.name,
+                current: alert.security_vulnerability.vulnerable_version_range,
+                fixed: alert.security_vulnerability.first_patched_version?.identifier,
+                severity: alert.security_advisory.severity
+              }))
+              .filter(v => v.fixed);
+            
+            console.log('Vulnerabilities:', JSON.stringify(vulnerabilities, null, 2));
+            core.setOutput('vulnerabilities', JSON.stringify(vulnerabilities));
+            core.setOutput('count', vulnerabilities.length);
+
+      # ... (rest of npm/maven/python steps from previous workflow)
+
+  auto-merge:
+    needs: fix-vulnerabilities
+    runs-on: ubuntu-latest
+    if: |
+      needs.fix-vulnerabilities.result == 'success' && 
+      (github.event_name == 'schedule' || inputs.auto_merge == true)
+    steps:
+      - name: Wait for PR
+        run: sleep 10
+        
+      - name: Auto-merge
+        run: |
+          PR_NUMBER=$(gh pr list --label security --json number --jq '.[0].number')
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr merge $PR_NUMBER --auto --squash
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
