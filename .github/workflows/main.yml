@@ -116,15 +116,15 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          
-      - name: Update npm packages
+
+      - name: Update npm packagesc
         if: steps.detect.outputs.type == 'npm' && steps.alerts.outputs.count > 0
         run: |
-          echo '${{ steps.alerts.outputs.vulnerabilities }}' | jq -r '.[] | .package' | while read package; do
-            echo "Updating $package..."
-            npm update "$package"
-          done
-          
+          echo '${{ steps.alerts.outputs.vulnerabilities }}' | jq -r '.[] | "\(.package)@\(.fixedVersion)"' | while read package_version; do
+            echo "Installing $package_version..."
+            npm install "$package_version" --save
+           done
+        
       - name: Run npm tests
         if: steps.detect.outputs.type == 'npm' && steps.alerts.outputs.count > 0
         run: |
