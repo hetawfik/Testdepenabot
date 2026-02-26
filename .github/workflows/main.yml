@@ -3,7 +3,7 @@ name: Auto-fix Dependabot alerts (Multi-ecosystem)
 on:
   schedule:
     - cron: '0 3 * * *'
-  workflow_dispatch:  # Enables manual trigger
+  workflow_dispatch:
     inputs:
       severity:
         description: 'Severity filter'
@@ -38,12 +38,6 @@ permissions:
 jobs:
   fix-vulnerabilities:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-      security-events: read
-      # Add this:
-      repository-projects: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -65,14 +59,18 @@ jobs:
           fi
           
           echo "type=$ECOSYSTEM" >> $GITHUB_OUTPUT
+          echo "Detected ecosystem: $ECOSYSTEM"
           
       - name: Get Dependabot alerts
         id: alerts
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.DEP_PAT }} 
+          github-token: ${{ secrets.DEP_PAT }}
           script: |
             const severity = '${{ inputs.severity || 'high,critical' }}';
+            const ecosystem = '${{ steps.detect.outputs.type }}';
+            
+            console.log(`Fetching alerts with severity: ${severity}, ecosystem: ${ecosystem}`);
             
             const alerts = await github.rest.dependabot.listAlertsForRepo({
               owner: context.repo.owner,
@@ -81,28 +79,208 @@ jobs:
               severity: severity
             });
             
-            const ecosystem = '${{ steps.detect.outputs.type }}';
+            console.log(`Total alerts found: ${alerts.data.length}`);
+            console.log('Raw alerts structure:', JSON.stringify(alerts.data.slice(0, 1), null, 2));
+            
             const ecosystemMap = {
               'npm': 'npm',
               'maven': 'maven',
               'python': 'pip'
             };
             
-            const vulnerabilities = alerts.data
-              .filter(alert => alert.security_advisory.package.ecosystem === ecosystemMap[ecosystem])
-              .map(alert => ({
-                package: alert.security_advisory.package.name,
-                current: alert.security_vulnerability.vulnerable_version_range,
-                fixed: alert.security_vulnerability.first_patched_version?.identifier,
-                severity: alert.security_advisory.severity
-              }))
-              .filter(v => v.fixed);
+            const targetEcosystem = ecosystemMap[ecosystem];
             
-            console.log('Vulnerabilities:', JSON.stringify(vulnerabilities, null, 2));
+            const vulnerabilities = alerts.data
+              .filter(alert => {
+                if (!alert.security_vulnerability) {
+                  console.log(`Alert ${alert.number}: Missing security_vulnerability`);
+                  return false;
+                }
+                
+                if (!alert.security_vulnerability.package) {
+                  console.log(`Alert ${alert.number}: Missing package info`);
+                  return false;
+                }
+                
+                const alertEcosystem = alert.security_vulnerability.package.ecosystem;
+                
+                if (!alertEcosystem) {
+                  console.log(`Alert ${alert.number}: Missing ecosystem`);
+                  return false;
+                }
+                
+                if (alertEcosystem !== targetEcosystem) {
+                  console.log(`Alert ${alert.number}: Ecosystem ${alertEcosystem} != ${targetEcosystem}`);
+                  return false;
+                }
+                
+                if (!alert.security_vulnerability.first_patched_version) {
+                  console.log(`Alert ${alert.number}: No fix available yet`);
+                  return false;
+                }
+                
+                return true;
+              })
+              .map(alert => ({
+                alertNumber: alert.number,
+                package: alert.security_vulnerability.package.name,
+                currentVersion: alert.security_vulnerability.vulnerable_version_range,
+                fixedVersion: alert.security_vulnerability.first_patched_version.identifier,
+                severity: alert.security_advisory.severity,
+                ecosystem: alert.security_vulnerability.package.ecosystem,
+                summary: alert.security_advisory.summary
+              }));
+            
+            console.log(`Fixable vulnerabilities for ${ecosystem}: ${vulnerabilities.length}`);
+            console.log('Vulnerabilities to fix:', JSON.stringify(vulnerabilities, null, 2));
+            
             core.setOutput('vulnerabilities', JSON.stringify(vulnerabilities));
-            core.setOutput('count', vulnerabilities.length);
-
-      # ... (rest of npm/maven/python steps from previous workflow)
+            core.setOutput('count', vulnerabilities.length.toString());
+            
+      - name: Check if vulnerabilities found
+        if: steps.alerts.outputs.count == '0'
+        run: |
+          echo "No fixable vulnerabilities found for ${{ steps.detect.outputs.type }}"
+          exit 0
+          
+      # NPM Updates
+      - name: Setup Node.js
+        if: steps.detect.outputs.type == 'npm' && steps.alerts.outputs.count > 0
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          
+      - name: Update npm packages
+        if: steps.detect.outputs.type == 'npm' && steps.alerts.outputs.count > 0
+        run: |
+          echo '${{ steps.alerts.outputs.vulnerabilities }}' | jq -r '.[] | .package' | while read package; do
+            echo "Updating $package..."
+            npm update "$package" || echo "Failed to update $package"
+          done
+          
+      - name: Run npm tests
+        if: steps.detect.outputs.type == 'npm' && steps.alerts.outputs.count > 0
+        run: |
+          npm ci
+          npm run build
+          npm test
+          
+      # Maven Updates
+      - name: Setup Java
+        if: steps.detect.outputs.type == 'maven' && steps.alerts.outputs.count > 0
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'maven'
+          
+      - name: Update Maven dependencies
+        if: steps.detect.outputs.type == 'maven' && steps.alerts.outputs.count > 0
+        run: |
+          echo '${{ steps.alerts.outputs.vulnerabilities }}' | jq -r '.[] | "\(.package):\(.fixedVersion)"' | while IFS=: read package version; do
+            echo "Updating $package to $version..."
+            GROUP_ID=$(echo "$package" | cut -d: -f1)
+            ARTIFACT_ID=$(echo "$package" | cut -d: -f2)
+            
+            mvn versions:use-dep-version \
+              -Dincludes="${GROUP_ID}:${ARTIFACT_ID}" \
+              -DdepVersion="$version" \
+              -DforceVersion=true || echo "Failed to update $package"
+          done
+          
+          mvn versions:commit
+          
+      - name: Run Maven tests
+        if: steps.detect.outputs.type == 'maven' && steps.alerts.outputs.count > 0
+        run: |
+          mvn clean verify
+          
+      # Python Updates
+      - name: Setup Python
+        if: steps.detect.outputs.type == 'python' && steps.alerts.outputs.count > 0
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          
+      - name: Update Python packages
+        if: steps.detect.outputs.type == 'python' && steps.alerts.outputs.count > 0
+        run: |
+          pip install pip-tools
+          
+          echo '${{ steps.alerts.outputs.vulnerabilities }}' | jq -r '.[] | "\(.package)==\(.fixedVersion)"' | while read package_version; do
+            echo "Updating $package_version..."
+            PACKAGE=$(echo "$package_version" | cut -d= -f1)
+            VERSION=$(echo "$package_version" | cut -d= -f3)
+            
+            if [ -f "requirements.txt" ]; then
+              sed -i "s/^${PACKAGE}==.*/${PACKAGE}==${VERSION}/" requirements.txt || \
+              sed -i "s/^${PACKAGE}>=.*/${PACKAGE}==${VERSION}/" requirements.txt || \
+              echo "${PACKAGE}==${VERSION}" >> requirements.txt
+              pip install -r requirements.txt
+            elif [ -f "pyproject.toml" ]; then
+              pip install "$package_version"
+              pip freeze > requirements-updated.txt
+            fi
+          done
+          
+      - name: Run Python tests
+        if: steps.detect.outputs.type == 'python' && steps.alerts.outputs.count > 0
+        run: |
+          if [ -f "pytest.ini" ] || grep -q pytest requirements.txt 2>/dev/null; then
+            pip install pytest
+            pytest
+          elif [ -f "setup.py" ]; then
+            python setup.py test
+          elif [ -f "tox.ini" ]; then
+            pip install tox
+            tox
+          else
+            echo "No test framework detected, skipping tests"
+          fi
+          
+      # Common steps
+      - name: Check for changes
+        id: changes
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            git status
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No changes detected"
+          fi
+          
+      - name: Create vulnerability summary
+        if: steps.changes.outputs.has_changes == 'true'
+        id: summary
+        run: |
+          echo "## Fixed Vulnerabilities" > vulnerability-summary.md
+          echo "" >> vulnerability-summary.md
+          echo '${{ steps.alerts.outputs.vulnerabilities }}' | jq -r '.[] | "- **\(.package)**: \(.currentVersion) → \(.fixedVersion) (\(.severity))"' >> vulnerability-summary.md
+          echo "" >> vulnerability-summary.md
+          cat vulnerability-summary.md
+          
+      - name: Create Pull Request
+        if: steps.changes.outputs.has_changes == 'true'
+        id: create-pr
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.DEPENDABOT_PAT }}
+          commit-message: 'security: fix ${{ steps.detect.outputs.type }} Dependabot vulnerabilities'
+          branch: security/dependabot-${{ steps.detect.outputs.type }}-fixes-${{ github.run_number }}
+          delete-branch: true
+          title: '🔒 Security: Fix ${{ steps.detect.outputs.type }} vulnerabilities'
+          body-path: vulnerability-summary.md
+          labels: security, dependabot, ${{ steps.detect.outputs.type }}
+          assignees: ${{ github.actor }}
+          
+      - name: Output PR info
+        if: steps.create-pr.outputs.pull-request-number
+        run: |
+          echo "Pull Request created: #${{ steps.create-pr.outputs.pull-request-number }}"
+          echo "PR URL: ${{ steps.create-pr.outputs.pull-request-url }}"
 
   auto-merge:
     needs: fix-vulnerabilities
@@ -111,14 +289,128 @@ jobs:
       needs.fix-vulnerabilities.result == 'success' && 
       (github.event_name == 'schedule' || inputs.auto_merge == true)
     steps:
-      - name: Wait for PR
-        run: sleep 10
+      - name: Wait for PR checks
+        run: sleep 30
         
-      - name: Auto-merge
-        run: |
-          PR_NUMBER=$(gh pr list --label security --json number --jq '.[0].number')
-          if [ -n "$PR_NUMBER" ]; then
-            gh pr merge $PR_NUMBER --auto --squash
-          fi
+      - name: Auto-merge security fixes
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.DEPENDABOT_PAT }}
+        run: |
+          PR_NUMBER=$(gh pr list \
+            --repo ${{ github.repository }} \
+            --label security \
+            --state open \
+            --json number \
+            --jq '.[0].number')
+          
+          if [ -n "$PR_NUMBER" ]; then
+            echo "Found PR #$PR_NUMBER, enabling auto-merge..."
+            gh pr merge $PR_NUMBER \
+              --repo ${{ github.repository }} \
+              --auto \
+              --squash
+            echo "Auto-merge enabled for PR #$PR_NUMBER"
+          else
+            echo "No open security PR found"
+          fi
+
+  post-merge-validation:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          token: ${{ secrets.DEPENDABOT_PAT }}
+          
+      - name: Check if security commit
+        id: check
+        run: |
+          MESSAGE=$(git log -1 --pretty=%B)
+          AUTHOR=$(git log -1 --pretty=%an)
+          
+          if [[ "$MESSAGE" == *"fix"*"Dependabot vulnerabilities"* ]] || [[ "$AUTHOR" == "github-actions[bot]" ]]; then
+            echo "is_security_fix=true" >> $GITHUB_OUTPUT
+            echo "This is a security fix commit"
+          else
+            echo "is_security_fix=false" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Detect project type for validation
+        if: steps.check.outputs.is_security_fix == 'true'
+        id: detect
+        run: |
+          if [ -f "package.json" ]; then
+            echo "type=npm" >> $GITHUB_OUTPUT
+          elif [ -f "pom.xml" ]; then
+            echo "type=maven" >> $GITHUB_OUTPUT
+          elif [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then
+            echo "type=python" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Setup Node.js for validation
+        if: steps.check.outputs.is_security_fix == 'true' && steps.detect.outputs.type == 'npm'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          
+      - name: Setup Java for validation
+        if: steps.check.outputs.is_security_fix == 'true' && steps.detect.outputs.type == 'maven'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'maven'
+          
+      - name: Setup Python for validation
+        if: steps.check.outputs.is_security_fix == 'true' && steps.detect.outputs.type == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          
+      - name: Validate npm on main
+        if: steps.check.outputs.is_security_fix == 'true' && steps.detect.outputs.type == 'npm'
+        run: |
+          npm ci
+          npm run build
+          npm test
+          
+      - name: Validate Maven on main
+        if: steps.check.outputs.is_security_fix == 'true' && steps.detect.outputs.type == 'maven'
+        run: |
+          mvn clean verify
+          
+      - name: Validate Python on main
+        if: steps.check.outputs.is_security_fix == 'true' && steps.detect.outputs.type == 'python'
+        run: |
+          pip install -r requirements.txt
+          if [ -f "pytest.ini" ] || grep -q pytest requirements.txt 2>/dev/null; then
+            pip install pytest
+            pytest
+          fi
+          
+      - name: Rollback and alert on failure
+        if: failure() && steps.check.outputs.is_security_fix == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.DEPENDABOT_PAT }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          COMMIT_SHA=$(git rev-parse HEAD)
+          git revert --no-edit HEAD
+          git push origin main
+          
+          gh issue create \
+            --repo ${{ github.repository }} \
+            --title "🚨 Security fix rollback - Manual intervention required" \
+            --body "Automated Dependabot security fixes were rolled back due to build failure on main branch.
+
+**Reverted commit:** $COMMIT_SHA
+**Ecosystem:** ${{ steps.detect.outputs.type }}
+**Branch:** main
+
+Please investigate the failures and apply fixes manually." \
+            --label "security,urgent,rollback"
