@@ -38,6 +38,12 @@ permissions:
 jobs:
   fix-vulnerabilities:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      security-events: read
+      # Add this:
+      repository-projects: read
     steps:
       - uses: actions/checkout@v4
         with:
